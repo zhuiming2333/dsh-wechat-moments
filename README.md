@@ -3,7 +3,6 @@
 > **开源地址：[github.com/zhuiming2333/dsh-wechat-moments](https://github.com/zhuiming2333/dsh-wechat-moments)** （MIT）
 >
 > 这里只是打包快照，最新版、issue、更新都以仓库为准。
-> 懒得看文档？直接跳到 [INSTALL.md](INSTALL.md) 跑一条命令。
 
 给 [DeepSeek-Harness](https://github.com/deepseek-ai)（DSH）用的**微信朋友圈**插件 + 技能包。
 
