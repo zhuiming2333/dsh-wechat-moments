@@ -16,6 +16,8 @@ param(
     [string]$ObjectId,
     [string]$CommentId,
     [string]$Text,
+    # 同 wechat-moments-post.ps1：文案走文件，绕开 Start-Process 的参数分词。
+    [string]$TextFile = '',
     [switch]$List,
     [switch]$Execute,
     [switch]$Quiet,
@@ -24,6 +26,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# -TextFile 优先：从文件读 UTF-8 文案，避免命令行分词问题。
+if ($TextFile) {
+    if (-not (Test-Path -LiteralPath $TextFile)) { throw "TextFile not found: $TextFile" }
+    $Text = [System.IO.File]::ReadAllText($TextFile, [System.Text.Encoding]::UTF8)
+    $Text = $Text.TrimEnd("`r", "`n")
+}
 
 # ---------- 配置 ----------
 # 一律从 wechat-moments.config.json 读，避免任何人的路径 / token / wxid 被写死进脚本。

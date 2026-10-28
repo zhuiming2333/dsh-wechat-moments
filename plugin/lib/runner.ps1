@@ -86,6 +86,18 @@ function Invoke-SkillScript {
     return [int]$code
 }
 
+# Stage a multi-line / space-containing string into a file and return its path.
+# Start-Process's -ArgumentList splits any element containing spaces, so a text
+# body with ordinary spaces (English words, etc.) arrives shredded across argv --
+# words even get eaten as the next parameter name. Writing it to disk and
+# passing -TextFile sidesteps argv quoting entirely.
+function Write-ArgFile {
+    param([string]$Name, [string]$Value)
+    $path = Join-Path $JobDir $Name
+    [System.IO.File]::WriteAllText($path, $Value, [System.Text.UTF8Encoding]::new($false))
+    return $path
+}
+
 try {
     Write-Status -State 'running'
 
@@ -112,7 +124,8 @@ try {
         'post' {
             $script = Join-Path $skillDir 'wechat-moments-post.ps1'
             $a = @('-Image', [string]$args_['image'])
-            if ($args_['text']) { $a += @('-Text', [string]$args_['text']) }
+            $body = [string]$args_['text']
+            if ($body) { $a += @('-TextFile', (Write-ArgFile -Name 'text.txt' -Value $body)) }
             if ([bool]$args_['dryRun']) { $a += '-DryRun' }
             $code = Invoke-SkillScript -ScriptPath $script -Arguments $a
         }
@@ -120,9 +133,9 @@ try {
             $script = Join-Path $skillDir 'wechat-moments-reply.ps1'
             $a = @(
                 '-ObjectId', [string]$args_['objectId'],
-                '-CommentId', [string]$args_['commentId'],
-                '-Text', [string]$args_['text']
-            )
+                '-CommentId', [string]$args_['commentId'])
+            $body = [string]$args_['text']
+            if ($body) { $a += @('-TextFile', (Write-ArgFile -Name 'text.txt' -Value $body)) }
             if (-not [bool]$args_['dryRun']) { $a += '-Execute' }
             $code = Invoke-SkillScript -ScriptPath $script -Arguments $a
         }

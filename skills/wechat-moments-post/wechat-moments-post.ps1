@@ -10,6 +10,12 @@
 param(
     [Parameter(Mandatory = $true)][string]$Image,
     [string]$Text = '',
+    # 文案也可以从文件读。-- 为什么要这个：
+    # runner.ps1 用 Start-Process -ArgumentList 传参，而它会把含空格的字符串
+    # 拆成多个参数。文案里有 "Windows"、"AI" 这类词时，整段会被拆散，
+    # 后面的词甚至会被当成下一个参数名（曾把 "Windows" 喂给 -WinWidth）。
+    # 走文件就完全没有这个问题。
+    [string]$TextFile = '',
     [switch]$DryRun,
     [switch]$NormalizeOnly,
     [switch]$NoPublish,
@@ -21,6 +27,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# -TextFile 优先：从文件读 UTF-8 文案，避免命令行分词问题。
+if ($TextFile) {
+    if (-not (Test-Path -LiteralPath $TextFile)) { throw "TextFile not found: $TextFile" }
+    $Text = [System.IO.File]::ReadAllText($TextFile, [System.Text.Encoding]::UTF8)
+    $Text = $Text.TrimEnd("`r", "`n")
+}
 
 # Write stdout as UTF-8. Without this Windows PowerShell encodes it with the OEM
 # code page (936), so Chinese log lines turn into mojibake for the caller.
