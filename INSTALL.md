@@ -1,5 +1,9 @@
 # 安装说明
 
+> **开源地址：[github.com/zhuiming2333/dsh-wechat-moments](https://github.com/zhuiming2333/dsh-wechat-moments)** （MIT）
+>
+> 这里只是打包快照，最新版、issue、更新都以仓库为准。
+
 整个安装只有一个命令。**不需要手工改任何文件、填任何 token。**
 
 ```powershell

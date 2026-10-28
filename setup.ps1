@@ -398,4 +398,6 @@ Write-Host '  3. 在对话里让我调 wechat_moments_feed 验证'
 Write-Host ''
 Write-Host '自测命令：' -ForegroundColor Cyan
 Write-Host ('  powershell -File "{0}\wechat-moments-reply.ps1" -List' -f $skillDst)
+Write-Host ''
+Write-Host '遇到问题 / 想提需求：https://github.com/zhuiming2333/dsh-wechat-moments' -ForegroundColor DarkGray
 exit 0
