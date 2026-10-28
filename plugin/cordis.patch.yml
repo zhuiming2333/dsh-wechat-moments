@@ -1,0 +1,8 @@
+# dsh-wechat-moments bundle patch.
+#
+# Host-only plugin (no client UI). The row lives here rather than in the
+# profile's own cordis.patch.yml so the plugin manager knows this entry belongs
+# to this package and the row survives that layer being rewritten.
+- insert:
+    - id: dsh-wechat-moments
+      name: dsh-wechat-moments
