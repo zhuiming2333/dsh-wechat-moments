@@ -102,7 +102,7 @@ function Find-Workspace {
     return $null
 }
 
-Step '1/6 找 WeChatAgent workspace'
+Step '1/7 找 WeChatAgent workspace'
 $wsPath = Find-Workspace
 if (-not $wsPath) {
     Bad '找不到 workspace（含 state\wechat-io-config.json 的目录）。请用 -Workspace 指定。'
@@ -113,7 +113,7 @@ if (-not $wsPath) {
 
 # ---------------------------------------------------------------- 2. token
 
-Step '2/6 读 reader 地址与 token'
+Step '2/7 读 reader 地址与 token'
 $ioConfig = $null
 if ($wsPath) {
     $ioFile = Join-Path $wsPath 'state\wechat-io-config.json'
@@ -138,7 +138,7 @@ else { Bad '拿不到 reader token。请用 -ReaderToken 指定。' }
 
 # ---------------------------------------------------------------- 3. wxid
 
-Step '3/6 问 reader 要本账号 wxid'
+Step '3/7 问 reader 要本账号 wxid'
 $resolvedWxid = ''
 $resolvedNick = ''
 if ($resolvedToken) {
@@ -154,8 +154,10 @@ if ($resolvedToken) {
         }
         if ($ioConfig -and $ioConfig.self_wxid) { $resolvedWxid = [string]$ioConfig.self_wxid }
     } catch {
-        Bad "调 /api/v1/sns/mine 失败：$($_.Exception.Message)"
-        Warn '  如果报 404，说明 reader 还没打过补丁；本脚本第 4 步会打，之后可以重跑。'
+        # 全新安装时这里必然 404 —— 补丁还没打，路由当然不存在。
+        # 不算错误，第 4 步打完补丁、第 5 步会再问一次。
+        Warn "reader 暂时还没有 /sns/mine（$($_.Exception.Message)）"
+        Warn '  正常：补丁还没打。第 4 步打完后会重新问一次。'
     }
 } else {
     Warn '没有 token，跳过 wxid 探测'
@@ -163,7 +165,7 @@ if ($resolvedToken) {
 
 # ---------------------------------------------------------------- 4. patch
 
-Step '4/6 给 reader-api.py 打朋友圈路由补丁'
+Step '4/7 给 reader-api.py 打朋友圈路由补丁'
 $patchScript = Join-Path $PkgRoot 'reader\patch-reader.py'
 $snsModule   = Join-Path $PkgRoot 'reader\sns_routes.py'
 $readerPy    = $null
@@ -234,9 +236,69 @@ if ($NoPatch) {
     }
 }
 
-# ---------------------------------------------------------------- 5. skills
+# ---------------------------------------------------------------- 5. restart reader
 
-Step '5/6 装技能脚本'
+Step '5/7 重启 reader 并补问 wxid'
+# 打完补丁不重启，reader 里跑的还是旧代码 —— 所有 /api/v1/sns/* 依旧 404。
+# 这一步只停「占着 5031 的那个进程」再起一个新的，不动 WeChatAgent 本体。
+$readerRestarted = $false
+if ($NoPatch) {
+    Warn '按 -NoPatch 跳过重启'
+} elseif (-not $readerPy -or -not $pyExe) {
+    Warn '补丁没打成，跳过重启'
+} else {
+    try {
+        $conns = Get-NetTCPConnection -LocalPort 5031 -State Listen -ErrorAction SilentlyContinue
+        if ($conns) {
+            $oldPids = @($conns.OwningProcess | Sort-Object -Unique)
+            foreach ($oldPid in $oldPids) { Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue }
+            Start-Sleep -Milliseconds 900
+            Ok ("已停掉旧 reader（pid " + ($oldPids -join ',') + "）")
+        } else {
+            Warn '5031 上没有监听进程（reader 没在跑？）'
+        }
+        $readerDir = Split-Path $readerPy -Parent
+        $prevPyIo2 = $env:PYTHONIOENCODING
+        $env:PYTHONIOENCODING = 'utf-8'
+        try {
+            $newProc = Start-Process -FilePath $pyExe -ArgumentList @('-B', 'reader-api.py') `
+                        -WorkingDirectory $readerDir -WindowStyle Hidden -PassThru
+        } finally {
+            if ($null -eq $prevPyIo2) { Remove-Item Env:\PYTHONIOENCODING -ErrorAction SilentlyContinue }
+            else { $env:PYTHONIOENCODING = $prevPyIo2 }
+        }
+        Start-Sleep -Seconds 4
+        if ($newProc -and -not $newProc.HasExited) {
+            Ok "新 reader 已启动（pid $($newProc.Id)）"
+            $readerRestarted = $true
+        } else {
+            Bad '新 reader 起来后立刻退出，见下面自检的错误'
+        }
+    } catch {
+        Bad "重启 reader 失败：$($_.Exception.Message)"
+        Warn '  可以手工重启 WeChatAgent，或在 workspace\scripts 下手动起 reader-api.py'
+    }
+}
+
+# 补丁打上、reader 也重启了，现在才问得到 wxid。
+if ($readerRestarted -and $resolvedToken -and -not $resolvedWxid) {
+    try {
+        $hdr = @{ Authorization = "Bearer $resolvedToken" }
+        $mine = Invoke-RestMethod "$resolvedReader/api/v1/sns/mine?limit=5" -Headers $hdr -TimeoutSec 20
+        $first = @($mine.posts) | Select-Object -First 1
+        if ($first -and $first.username) {
+            $resolvedWxid = [string]$first.username
+            Ok "wxid = $resolvedWxid"
+        }
+    } catch {
+        Warn "补问 wxid 仍失败：$($_.Exception.Message)"
+        Warn '  不影响安装。稍后重跑本脚本，或手工在配置文件里填 ownWxid。'
+    }
+}
+
+# ---------------------------------------------------------------- 6. skills
+
+Step '6/7 装技能脚本'
 $skillSrc = Join-Path $PkgRoot 'skills\wechat-moments-post'
 $skillDst = Join-Path $env:USERPROFILE '.dsh\skills\wechat-moments-post'
 if (-not (Test-Path -LiteralPath $skillSrc)) {
@@ -255,7 +317,7 @@ if (-not (Test-Path -LiteralPath $skillSrc)) {
 
 # ---------------------------------------------------------------- 6. plugin
 
-Step '6/6 装 DSH 插件'
+Step '7/7 装 DSH 插件'
 if ($NoProfile) {
     Warn '按 -NoProfile 跳过'
 } else {
@@ -363,7 +425,7 @@ if ($resolvedToken) {
         }
     } catch {
         Bad "reader /api/v1/sns/stats 不可用：$($_.Exception.Message)"
-        Warn '  通常是补丁没打上，或 reader 进程没重启。'
+        Warn '  补丁已打、reader 已尝试重启。仍 404 的话，重启一次 WeChatAgent 再重跑本脚本。'
     }
 } else {
     Bad '没有 token，跳过自检'
@@ -392,9 +454,11 @@ if ($script:Problems.Count -gt 0) {
 Write-Host '全部就绪。' -ForegroundColor Green
 Write-Host ''
 Write-Host '下一步（必须做）：' -ForegroundColor Cyan
-Write-Host '  1. 重启 WeChatAgent 的 reader 进程，让补丁生效'
-Write-Host '  2. 重启 DSH 桌面端，让插件 5 个工具出现'
-Write-Host '  3. 在对话里让我调 wechat_moments_feed 验证'
+Write-Host '  1. 重启 DSH 桌面端，让插件的 5 个工具出现'
+Write-Host '  2. 在对话里让我调 wechat_moments_feed 验证'
+Write-Host ''
+Write-Host '注意：WeChatAgent 更新/重启会整个覆盖 reader-api.py，把朋友圈路由弄丢。' -ForegroundColor Yellow
+Write-Host '      那时所有 /api/v1/sns/* 会变成 404 —— 重跑一次本脚本即可（幂等）。' -ForegroundColor Yellow
 Write-Host ''
 Write-Host '自测命令：' -ForegroundColor Cyan
 Write-Host ('  powershell -File "{0}\wechat-moments-reply.ps1" -List' -f $skillDst)
