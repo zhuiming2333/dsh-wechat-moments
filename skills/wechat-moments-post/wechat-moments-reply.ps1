@@ -194,7 +194,7 @@ function Resolve-Target($mine, [string]$oid, [string]$cid) {
 # DB 里存的是原始昵称，朋友圈界面上显示的是备注名：
 #   真由理 → 南华 / 翮 → 高一健身李帅佐
 # 按 DB 昵称去 OCR 里找永远找不到，之前只能退化成「正文模糊匹配」，
-# 短评论（「真的假的」「大肥鱼」）就会匹配到隔壁那条，回复到别人头上。
+# 短评论（「真的假的」「好吧」这种两三个字的）就会匹配到隔壁那条，回复到别人头上。
 # reader 的 /api/v1/contacts 能给出 displayName，这才是界面上印的字。
 
 $script:DispCache = @{}
