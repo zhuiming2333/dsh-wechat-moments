@@ -22,10 +22,15 @@ param(
     [switch]$Execute,
     [switch]$Quiet,
     [switch]$DryRunUi,
+[switch]$Batch,
+[switch]$DumpOcr,
+[int]$Max = 0,
+[string]$TextMapFile = '',
     [double]$OcrScale = 2.0
 )
 
 $ErrorActionPreference = 'Stop'
+$script:StrayMoved = 0
 
 # -TextFile 优先：从文件读 UTF-8 文案，避免命令行分词问题。
 if ($TextFile) {
@@ -217,6 +222,72 @@ function Get-DisplayName([string]$dbNick, [string]$username) {
 
 # ---------- 列出待回复 ----------
 
+# ---------- 批量模式：一次跑完所有待回复 ----------
+# 每条之间不复用界面状态（都从相册重新进来），所以最稳但慢：一条约 40~90 秒。
+# -Max N 限制本轮条数（0 = 全部）。台账会跳过已回过的，重复跑不会重复发。
+if ($Batch) {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $mine0 = Get-MyMoments 30
+    $ledger0 = Read-Ledger
+    $script:tasks = @()
+    foreach ($pp in $mine0.posts) {
+        foreach ($cc in $pp.candidates) {
+            if ($ledger0.ContainsKey((LedgerKey $pp.object_id $cc.comment_id))) { continue }
+            $script:tasks += [pscustomobject]@{
+                oid  = [string]$pp.object_id
+                cid  = [string]$cc.comment_id
+                nick = [string]$cc.nickname
+                text = ([string]$cc.content -replace "`r?`n", ' ').Trim()
+            }
+        }
+    }
+    if ($Max -gt 0 -and $script:tasks.Count -gt $Max) { $script:tasks = $script:tasks[0..($Max-1)] }
+    $script:TextMap = @{}
+    if ($TextMapFile) {
+        if (-not (Test-Path -LiteralPath $TextMapFile)) { throw "TextMapFile not found: $TextMapFile" }
+        $j = [System.IO.File]::ReadAllText($TextMapFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+        foreach ($prop in $j.PSObject.Properties) { $script:TextMap[[string]$prop.Name] = [string]$prop.Value }
+        Write-Host "已加载 $($script:TextMap.Count) 条文案映射" -ForegroundColor DarkGray
+    }
+    Write-Host "批量待回复：$($script:tasks.Count) 条`n" -ForegroundColor Cyan
+    $ok = 0; $skip = 0; $fail = 0
+    foreach ($task in $script:tasks) {
+        Write-Host ("━" * 60) -ForegroundColor DarkGray
+        Write-Host "[$($ok + $skip + $fail + 1)/$($script:tasks.Count)] $($task.nick): $($task.text)"
+        # 用子进程跑单条，避免状态串味；回复文案走回复逻辑里的自动生成
+        $txt = ''
+        # 键必须是 oid:cid —— 不同动态下都有 cid=1，只用 cid 会串到别的动态
+        $tkey = "$($task.oid):$($task.cid)"
+        if ($script:TextMap -and $script:TextMap.ContainsKey($tkey)) { $txt = [string]$script:TextMap[$tkey] }
+        if (-not $txt) { $skip++; Write-Host "  没有对应文案，跳过" -ForegroundColor DarkGray; continue }
+        $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$PSCommandPath,
+                     '-ObjectId',$task.oid,'-CommentId',$task.cid,'-Text',$txt,'-Execute','-Quiet')
+        # 本脚本 $ErrorActionPreference='Stop'：子进程写 stderr 会被当成终止性错误，
+        # 整批就断在这一条上。必须单独 try/catch 兜住，一条失败不影响后面。
+        $exit = 1
+        $out = @()
+        $prev = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $out = & powershell @argList 2>&1
+            $exit = $LASTEXITCODE
+        } catch {
+            $exit = 1
+            $out = @("$($_.Exception.Message)")
+        } finally {
+            $ErrorActionPreference = $prev
+        }
+        $code = $exit
+        $tail = (@($out) | Select-Object -Last 3) -join ' | '
+        if ($code -eq 0) { $ok++; Write-Host "  OK  $tail" -ForegroundColor Green }
+        elseif ($code -eq 2) { $skip++; Write-Host "  安全跳过  $tail" -ForegroundColor Yellow }
+        else { $fail++; Write-Host "  失败  $tail" -ForegroundColor Red }
+    }
+    Write-Host ("━" * 60) -ForegroundColor DarkGray
+    Write-Host "批量结束：成功 $ok / 跳过 $skip / 失败 $fail" -ForegroundColor Cyan
+    exit 0
+}
+
 if ($List) {
     $mine = Get-MyMoments 30
     $ledger = Read-Ledger
@@ -287,6 +358,7 @@ if (-not $Execute) {
 
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
+try { Add-Type -AssemblyName System.Windows.Forms } catch { }
 
 Add-Type @"
 using System;
@@ -295,12 +367,21 @@ public class W32Moments {
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, UIntPtr e);
     [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint f, UIntPtr e);
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr h, int x, int y, int w, int t, bool repaint);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, System.Text.StringBuilder s, int n);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    public delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc p, IntPtr l);
 }
 "@
 
@@ -322,7 +403,60 @@ $null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Foundation, ContentType
 $null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
 $null = [Windows.Globalization.Language, Windows.Foundation, ContentType = WindowsRuntime]
 
+# ---------- 清掉压在微信上的「空壳」窗口 ----------
+# 微信偶尔会留一个 title='Weixin'、class=Qt51514QWindowIcon 的空壳窗口盖在上层，
+# 它不可见地接收所有点击，导致「点了但没反应」。实测过一次 360x1208 的空壳挡死详情页。
+# 判据：可见 + class 含 Qt51514 + 标题恰为 ASCII 'Weixin'（主窗口标题是中文「微信」，
+# 发布框是「朋友圈」，资料卡是 Qt51514QWindowToolSaveBits）→ 一律挪到屏幕外。
+function Restore-Win([IntPtr]$h) {
+    # 微信被最小化时 GetWindowRect 返回 -32000,-32000 / 160x28，
+    # 所有按几何算出来的坐标都会落到屏幕外，表现为「点哪都没反应」。
+    # 每次点击/截图前都确认一次，代价只有一次 IsIconic 调用。
+    if ($h -eq [IntPtr]::Zero) { return }
+    if ([W32Moments]::IsIconic($h)) {
+        [W32Moments]::ShowWindow($h, 9) | Out-Null
+        Start-Sleep -Milliseconds 420
+        Write-Host "[ui] 微信窗口原本是最小化状态，已还原" -ForegroundColor Yellow
+    }
+}
+
+function Clear-Stray([IntPtr]$Keep) {
+    $moved = 0
+    $screenW = 1920
+    try {
+        $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+        $screenW = $b.Width
+    } catch { }
+    $cb = [W32Moments+EnumProc]{
+        param([IntPtr]$h, [IntPtr]$l)
+        if (-not [W32Moments]::IsWindowVisible($h)) { return $true }
+        if ($h -eq $Keep) { return $true }
+        $cn = New-Object System.Text.StringBuilder 256
+        [void][W32Moments]::GetClassName($h, $cn, 256)
+        # 只认主壳窗口那个类。资料卡/小浮窗也是 Qt51514QWindowToolSaveBits，
+        # 用通配 "*Qt51514*" 会把刚弹出的资料卡一起挪走（踩过）。
+        if ($cn.ToString() -ne 'Qt51514QWindowIcon') { return $true }
+        $tt = New-Object System.Text.StringBuilder 256
+        [void][W32Moments]::GetWindowTextW($h, $tt, 256)
+        if ($tt.ToString() -ne 'Weixin') { return $true }
+        $r = New-Object W32Moments+RECT
+        [void][W32Moments]::GetWindowRect($h, [ref]$r)
+        # SWP_NOSIZE=1 SWP_NOZORDER=4 SWP_NOACTIVATE=0x10
+        [void][W32Moments]::SetWindowPos($h, [IntPtr]::Zero, ($screenW + 200), $r.Top, 0, 0, 0x1 -bor 0x4 -bor 0x10)
+        Write-Host ("[ui] 挪走遮挡空壳窗口 {0}（{1}x{2} @ {3},{4}）" -f $h, ($r.Right-$r.Left), ($r.Bottom-$r.Top), $r.Left, $r.Top) -ForegroundColor Yellow
+        $script:StrayMoved++
+        return $true
+    }
+    [void][W32Moments]::EnumWindows($cb, [IntPtr]::Zero)
+    return $moved
+}
+
 function Click-At([int]$x, [int]$y) {
+    if (-not $script:StrayCleared) {
+        [void](Clear-Stray $script:MainHwnd)
+        $script:StrayCleared = $true
+    }
+    Restore-Win $script:MainHwnd
     [W32Moments]::SetCursorPos($x, $y) | Out-Null
     Start-Sleep -Milliseconds 60
     [W32Moments]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
@@ -544,12 +678,28 @@ function Capture-Window([IntPtr]$hwnd, [double]$xFracFrom = 0, [double]$xFracTo 
     # NoActivate：检测回复框时必须用。回复框是依附在主窗口上的浮层，
     # 每次截图都把主窗口提到最前会把它压下去，于是永远拍不到、判定成「没弹出」，
     # 然后重试点击 —— 越重试越拍不到。
+    Restore-Win $script:MainHwnd
     $raise = $hwnd
     if ($TopHwnd -ne [IntPtr]::Zero) { $raise = $TopHwnd }
     if (-not $NoActivate) {
-        [W32Moments]::ShowWindow($raise, 9) | Out-Null
-        [W32Moments]::SetForegroundWindow($raise) | Out-Null
-        Start-Sleep -Milliseconds 260
+        # Windows 前台锁会让 SetForegroundWindow 静默失败（返回真但窗口没上来），
+        # 而 CopyFromScreen 抓的是屏幕像素 —— 于是截到压在上面的别的窗口。
+        # 必须校验「前台窗口真的就是它」，不成就重试。
+        $ok = $false
+        for ($act = 0; $act -lt 6; $act++) {
+            [W32Moments]::ShowWindow($raise, 9) | Out-Null
+            [W32Moments]::SetForegroundWindow($raise) | Out-Null
+            Start-Sleep -Milliseconds 220
+            $fg = [W32Moments]::GetForegroundWindow()
+            if ($fg -eq $raise) { $ok = $true; break }
+            [W32Moments]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+            [W32Moments]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+            Start-Sleep -Milliseconds 120
+        }
+        if (-not $ok) {
+            Write-Host "[ui] 警告：无法把窗口提到最前，截图可能被遮挡" -ForegroundColor Yellow
+        }
+        Start-Sleep -Milliseconds 140
     }
     $r = New-Object W32Moments+RECT
     if (-not [W32Moments]::GetWindowRect($hwnd, [ref]$r)) { throw "GetWindowRect 失败" }
@@ -943,12 +1093,17 @@ $wr = New-Object W32Moments+RECT
 $winW = $wr.Right - $wr.Left
 $winH = $wr.Bottom - $wr.Top
 Write-Host "[ui] 微信窗口 ($($wr.Left),$($wr.Top)) ${winW}x${winH}"
+$script:MainHwnd = $hwnd
+[void](Clear-Stray $script:MainHwnd)
 
 $nick = $target.Comment.nickname
 $cont = $target.Comment.content
 
 # 目标动态正文前 14 字，用来在相册里认出这条动态
-$pc = Normalize (($target.Post.content -replace "`r?`n", ' '))
+# 完整正文（不截断）用来做「这一行是否属于正文」的子串判定；
+# 截断版 $pc 只用来做相似度比对。
+$nPc = Normalize (($target.Post.content -replace "`r?`n", ' '))
+$pc = $nPc
 if ($pc.Length -gt 14) { $pc = $pc.Substring(0, 14) }
 
 $probe = $Text
@@ -1034,16 +1189,16 @@ $winW = $wr.Right - $wr.Left
 $winH = $wr.Bottom - $wr.Top
 Write-Host "[ui] 点击时真实几何 ($($wr.Left),$($wr.Top)) ${winW}x${winH}"
 
-# 实测（窗口 1180x1300@20,20）：头像圆心在窗口内 (52,95)，半径约 22px。
-# 旧候选全部擦着圆边，圆角上会点空。
-$avatarTries = @(
-    @([int]($winW * 0.044), [int]($winH * 0.073)),
-    @([int]($winW * 0.044), [int](($winH * 0.073) + 9)),
-    @([int]($winW * 0.044), [int](($winH * 0.073) - 9)),
-    @([int](($winW * 0.044) - 7), [int]($winH * 0.073)),
-    @([int]($winW * 0.044), [int]($winH * 0.075)),
-    @(35, 65), @(52, 95), @(46, 88), @(58, 102)
-)
+# 头像圆心的比例在不同窗口尺寸下并不稳定（实测 1180x1300 时圆心在窗口内
+# (40,78)，按 0.044/0.073 算出来是 (52,95) —— 落在圆边外，点空）。
+# 与其猜比例，不如在左上角区域做一次小网格扫描：点一个就轮询资料卡有没有出来，
+# 出来了立刻停。头像直径约 44px，步长 10px 一定能踩到圆心附近。
+$avatarTries = New-Object System.Collections.ArrayList
+foreach ($gy in @(0.050, 0.060, 0.070, 0.080, 0.090)) {
+    foreach ($gx in @(0.025, 0.034, 0.043, 0.052, 0.061)) {
+        [void]$avatarTries.Add(@([int]($winW * $gx), [int]($winH * $gy)))
+    }
+}
 foreach ($av in $avatarTries) {
     if ($cardHwnd -ne [IntPtr]::Zero) { break }
     $avatarX = [int]($wr.Left + $av[0])
@@ -1052,8 +1207,9 @@ foreach ($av in $avatarTries) {
     Click-At $avatarX $avatarY
     # 资料卡是独立弹窗，弹出有延迟；轮询几次再判定，别急着换偏移重点
     # （重点会把已经弹出来的卡又点掉）。
-    foreach ($w in 1..5) {
-        Start-Sleep -Milliseconds 600
+    # 网格扫描点多，单点轮询要短；资料卡实测 300~500ms 就出来了。
+    foreach ($w in 1..3) {
+        Start-Sleep -Milliseconds 420
         $cardHwnd = Get-CardHwnd
         if ($cardHwnd -ne [IntPtr]::Zero) { break }
     }
@@ -1064,7 +1220,7 @@ foreach ($av in $avatarTries) {
 if ($cardHwnd -eq [IntPtr]::Zero) {
     # 以前这里会退回主窗口截图继续跑，结果把左侧导航里的「朋友圈」当成资料卡标签，
     # 点过去什么也不会发生，最后以「没能打开相册」告终，真正的病因被藏了起来。
-    throw "点了头像但没弹出个人资料卡（试了 4 个偏移）。不做后续点击，避免误操作。请确认微信主窗口停在聊天列表、且没有别的窗口挡在前面。"
+    throw "点了头像但没弹出个人资料卡（左上角网格扫描 $($avatarTries.Count) 个点全部落空）。不做后续点击，避免误操作。请确认微信主窗口停在聊天列表、且没有别的窗口挡在前面。"
 }
 
 # 关键：卡片是 Qt 弹出层，**一失去激活或空闲一两秒就会自己关掉**。
@@ -1082,10 +1238,15 @@ if ($DryRunUi) {
     return
 }
 
-function Test-Album($lines) {
+function Test-Album($lines, $needle = '') {
     foreach ($ln in $lines) {
         $t = Normalize $ln.Text
         if ($t -eq '置顶' -or $t -eq '今天' -or $t -eq '昨天') { return $true }
+        # 分段标题会被 OCR 读丢（「置顶」读成「0」「画百」之类），只认它们会误判成「相册没开」，
+        # 实测就这样白跑过好几轮。补一条更硬的证据：已经能看到目标动态的正文片段 = 相册开了。
+        if ($needle -and $needle.Length -ge 6) {
+            if ((Sim $needle $t) -ge 0.62) { return $true }
+        }
     }
     return $false
 }
@@ -1122,25 +1283,33 @@ for ($ci = 0; $ci -lt $cands.Count; $ci++) {
     Write-Host ("[ui] 点资料卡缩略图 ({0},{1})  比例 {2},{3}" -f $tx, $ty, $c[0], $c[1])
     Click-At $tx $ty
     Start-Sleep -Milliseconds 2200
-    # 「我的朋友圈」在这个版本里嵌进主窗口右半边（主窗口会变宽），先看主窗口。
+    # 最硬的证据是「相册窗口存在」——它是独立顶层窗口（Qt 的「朋友圈」或 CEF 的
+    # Chrome_WidgetWin_0/WeChatAppEx）。以前只靠 OCR 找「置顶/今天/昨天」，
+    # 但相册一滚动这些分段标题就出屏了，于是明明开着也判成「没开」，
+    # 白跑六轮候选点、最后误报「没能打开相册」。窗口在 = 相册开了，先认它。
+    $mHwnd = Get-MomentsHwnd
+    if ($mHwnd -ne [IntPtr]::Zero) {
+        Write-Host "[ui] 相册窗口已出现 $mHwnd"
+        break
+    }
+    # 相册嵌在主窗口右半边时没有独立窗口，退回 OCR 判据。
     $sA = Capture-Window $hwnd 0 1.0
     $lA = Ocr-Window $sA $OcrScale
-    if (Test-Album $lA) { break }
-    $mHwnd = Get-MomentsHwnd
+    if (Test-Album $lA $pc) { break }
     if ($mHwnd -ne [IntPtr]::Zero) {
         # 相册是独立窗口（Qt 或 CEF 都可能），必须把它提到最前再截图，
         # 否则 CopyFromScreen 抓到的是压在上面的窗口。
         $sA = Capture-Window $mHwnd 0 1.0 ([IntPtr]::Zero)
         $lA = Ocr-Window $sA $OcrScale
-        if (Test-Album $lA) { break }
+        if (Test-Album $lA $pc) { break }
         # CEF 版相册（Chrome_WidgetWin_0）首帧可能是空的，再等一拍重试。
         Start-Sleep -Milliseconds 900
         $sA = Capture-Window $mHwnd 0 1.0 ([IntPtr]::Zero)
         $lA = Ocr-Window $sA $OcrScale
-        if (Test-Album $lA) { break }
+        if (Test-Album $lA $pc) { break }
     }
 }
-if (-not (Test-Album $lA)) {
+if ($mHwnd -eq [IntPtr]::Zero -and -not (Test-Album $lA $pc)) {
     # 失败时把整窗 OCR 全量写进日志，用几十行文字就能判断当时屏幕上到底是什么，
     # 比再截一张 2560x1440 的图省得多。
     Write-Host "[ui] 相册没识别到。整窗 OCR 全量：" -ForegroundColor Yellow
@@ -1177,7 +1346,16 @@ for ($k = 0; $k -le 12 -and -not $found; $k++) {
         $lA = Ocr-Window $sA $OcrScale
     }
     foreach ($ln in $lA) {
-        $s = Sim $pc (Normalize $ln.Text)
+        $nLn = Normalize $ln.Text
+        if (-not $nLn) { continue }
+        # 长正文会被 OCR 拆成好几行，拿「整段正文」去比「单行」，
+        # 相似度天然很低（实测长文只有 0.64，离 0.55 阈值只差一点）。
+        # 正确做法：只要这一行是正文里的一段（子串）就算命中，给满分。
+        if ($nLn.Length -ge 6 -and $nPc.Contains($nLn)) {
+            $found = [pscustomobject]@{ Line = $ln; Score = 1.0 }
+            break
+        }
+        $s = Sim $pc $nLn
         if ($s -ge 0.55) {
             $found = [pscustomobject]@{ Line = $ln; Score = $s }
             break
@@ -1307,6 +1485,12 @@ function Find-CommentRow($lines) {
 }
 
 $row = Find-CommentRow $linesD
+if ($DumpOcr) {
+    Write-Host "[dump] 截图 $($s.Path) 原点 $($s.Left),$($s.Top) $($s.Width)x$($s.Height)" -ForegroundColor Magenta
+    foreach ($dl in $linesD) {
+        Write-Host ("[dump] absX={0,5} absY={1,5}  w={2,4} h={3,3}  {4}" -f [int]($dl.OX + $dl.X), [int]($dl.OY + $dl.Y), [int]$dl.W, [int]$dl.H, (Normalize $dl.Text)) -ForegroundColor Magenta
+    }
+}
 if (-not $row) {
     # 详情页会记住上次滚到的位置，目标评论可能在视野上方。
     # 先滚到顶再看一遍，然后才往下逐段找。
@@ -1362,8 +1546,20 @@ if ($dateLeft -gt 0) {
     $clickX = $dateLeft - 34
     Write-Host "[ui] 固定点时间戳左侧空白：日期左端=$dateLeft → ($clickX)"
 } else {
-    $clickX = [int]($wr.Left + $winW * 0.82)
-    Write-Host "[ui] 没读到日期，按几何取名字右侧（$clickX）" -ForegroundColor Yellow
+    # 读不到时间戳时（OCR 常把它读成 `18£0`、`在 天 1 5 ： 彐 7` 这种垃圾），
+    # 退到「昵称右端 + 34」——比按窗口比例猜准得多，因为昵称右端是实测出来的。
+    # 窗口在流程中途会自己变宽（实测 1180 → 1544），所以必须重读几何，
+    # 不能再用进详情页之前那个 $wr/$winW。
+    $wrNow0 = New-Object W32Moments+RECT
+    [W32Moments]::GetWindowRect($hwnd, [ref]$wrNow0) | Out-Null
+    $winWNow0 = $wrNow0.Right - $wrNow0.Left
+    if ($nameRight -gt 0) {
+        $clickX = $nameRight + 34
+        Write-Host "[ui] 没读到时间戳，退到昵称右端 +34（$clickX）" -ForegroundColor Yellow
+    } else {
+        $clickX = [int]($wrNow0.Left + $winWNow0 * 0.82)
+        Write-Host "[ui] 没读到时间戳也没有昵称，按几何取名字右侧（$clickX）" -ForegroundColor Yellow
+    }
 }
 # 截图原点必须取自真正的 OCR 行（$row 只是包装对象，没有 OX/OY）。
 # 取错了会少掉窗口偏移，整行点偏到上一条评论上。
@@ -1385,7 +1581,20 @@ function Test-ReplyBox {
     # 0.66 是按「详情页嵌在主窗口右半边」估的。但详情页实际上经常是**独立顶层窗口**
 # （实测 Weixin 540x1164@667,140），内容从窗口 53% 处就开始，用 0.66 会把
 # 输入框里刚打进去的文字过滤掉，于是误判「没看到文字」。0.53 两种形态都能包住。
-$paneAbs = $wr.Left + $winW * 0.53
+# 微信会在流程中途自己变宽（实测 1180 → 1544），用流程开头的 $wr/$winW
+    # 算右半区起点会漂到窗口外，于是回复框明明弹了也判成没弹。每帧重读。
+    $wrNow = New-Object W32Moments+RECT
+    [W32Moments]::GetWindowRect($hwnd, [ref]$wrNow) | Out-Null
+    $winWNow = $wrNow.Right - $wrNow.Left
+    # 0.53 那条裁切只对「主窗口」成立（它左半边是聊天列表）。
+    # 详情页/相册经常是**独立顶层窗口**（实测相册 921x891 @1181,174），
+    # 整个窗口都是朋友圈内容，再按 0.53 砍掉左半区，会把刚打进去的文字和
+    # 占位字全过滤掉 —— 表现就是「框明明弹了却判成没弹」。
+    if ($hwnd -eq $script:MainHwnd) {
+        $paneAbs = $wrNow.Left + $winWNow * 0.53
+    } else {
+        $paneAbs = $wrNow.Left
+    }
     foreach ($ln in $ls) {
         if ($ln.Y -lt $bottomMin) { continue }
         if (($ln.OX + $ln.X) -lt $paneAbs) { continue }
@@ -1397,16 +1606,46 @@ $paneAbs = $wr.Left + $winW * 0.53
     # 任何基于文字前缀的判据都会漏判（漏判的代价是重试点击，反而把框点没了）。
     # 所以只按「位置 + 形状」认：底部最靠下、不是「发送」、原文不带冒号、长度 ≤24 的那一行。
     # 评论区里带「回复 X：内容」的行都有冒号且位置更高，不会被选中。
-    $best = $null
+    # ⚠ 2026-10-28 事故复盘：以前这里「底部最靠下、不带冒号、长度<=24 的行」就直接判定
+    #   回复框已弹出。但评论区里本来就有一堆「回复 kagami：xxx」的行，而 OCR 经常把冒号
+    #   认成「．」或直接吞掉 —— 冒号过滤形同虚设，于是**最新一条评论**被当成了输入框占位字。
+    #   结果：脚本以为框弹了（其实没弹），后面把字打进空白处、读不到，白跑一轮。
+    #
+    #   真正的判据只能用「与文字内容无关」的信号：回复框是**贴在右半屏最底部的一整条**，
+    #   里面有绿色「发送」按钮和一根输入框边框。所以要求：
+    #     1) 该行必须在窗口最底部 18% 之内（评论区滚到底时最后一行的位置仍明显更高）；
+    #     2) 该行下方 60px 内不能再有别的文字（回复框下面就是窗口边缘）。
+    #   同时保留占位字本身（用来核对回复对象），但「是否弹出」不再取决于它。
+    $bottomBand = $s.Height * 0.82
+    $cands = @()
     foreach ($ln in $ls) {
-        if ($ln.Y -lt ($s.Height * 0.60)) { continue }
+        if ($ln.Y -lt $bottomBand) { continue }
         if (($ln.OX + $ln.X) -lt $paneAbs) { continue }
-        $t = Normalize $ln.Text
-        if (-not $t) { continue }
-        if ($t -eq '发送') { continue }
-        if ($ln.Text.Contains('：') -or $ln.Text.Contains(':')) { continue }
-        if ($t.Length -gt 24) { continue }
-        if ($null -eq $best -or $ln.Y -gt $best.Y) { $best = $ln }
+        $tt = Normalize $ln.Text
+        if (-not $tt) { continue }
+        if ($tt -eq '发送') { continue }
+        $cands += $ln
+    }
+    $best = $null
+    $bestScore = -1.0
+    foreach ($ln in $cands) {
+        # 它下面 60px 内不许有别的候选（最后一条评论下面紧跟着就是下一条/没有输入框）
+        $hasBelow = $false
+        foreach ($o in $cands) {
+            if ($o -eq $ln) { continue }
+            $dy = $o.Y - $ln.Y
+            if ($dy -gt 6 -and $dy -lt 60) { $hasBelow = $true; break }
+        }
+        if ($hasBelow) { continue }
+        if ($ln.Y -lt ($s.Height - 96)) { continue }
+        # 占位字就是「回复 <昵称>」，开头必定是「回」（OCR 会读成
+        # 「丨回原kagami」「回过源」…但头字大多还在）。
+        # 2026-10-28 实测：不加这个优先级会把底部的**正文行**（当时读成
+        # 「插件开源到github了」）当成占位字，靠后面 3 倍重读才救回来。
+        $tt = Normalize $ln.Text
+        $score = $ln.Y
+        if ($tt.StartsWith('回复') -or $tt.StartsWith('回')) { $score += 100000 }
+        if ($score -gt $bestScore) { $bestScore = $score; $best = $ln }
     }
     if ($best) { return [pscustomobject]@{ Ok = $true; Kind = 'placeholder'; Line = $best; All = $ls } }
     return [pscustomobject]@{ Ok = $false; All = $ls }
@@ -1420,6 +1659,10 @@ for ($try = 0; $try -lt 6; $try++) {
 }
 if (-not $box.Ok) {
     Write-Host "[ui] 第一次点击没弹出回复框，换位置再试" -ForegroundColor Yellow
+    # 重试前再重读一次几何：下面的兜底落点要用它。
+    $wrNowR = New-Object W32Moments+RECT
+    [W32Moments]::GetWindowRect($hwnd, [ref]$wrNowR) | Out-Null
+    $winWNowR = $wrNowR.Right - $wrNowR.Left
     # 评论行只有十几像素高，绝对坐标稍有漂移就会点进行间空隙。
     # 所以纵向 ±6 / ±12 都试一遍，再横向往右挪。
     $retry = @(
@@ -1429,7 +1672,7 @@ if (-not $box.Ok) {
         @($clickX, ($clickY + 12)),
         @(([int]($nameRight + 40)), $clickY),
         @(([int]($nameRight + 40)), ($clickY - 6)),
-        @(([int]($wr.Left + $winW * 0.88)), $clickY)
+        @(([int]($wrNowR.Left + $winWNowR * 0.88)), $clickY)
     )
     foreach ($pt in $retry) {
         Click-At $pt[0] $pt[1]
@@ -1485,6 +1728,15 @@ if ($box.Kind -eq 'placeholder') {
     }
 }
 
+# 微信会在流程中途自己改窗口大小/位置（实测 1180x1300@20,20 → 1544x1010@317,79），
+# 用流程开头读的 $wr 算底部坐标会落到窗口外（曾算出 y=1274，窗口底只到 1089）。
+# 所有「按窗口几何算坐标」前都必须重读一次。
+$wr = New-Object W32Moments+RECT
+[W32Moments]::GetWindowRect($hwnd, [ref]$wr) | Out-Null
+$winW = $wr.Right - $wr.Left
+$winH = $wr.Bottom - $wr.Top
+Write-Host ("[ui] 输入区前重读几何 ({0},{1}) {2}x{3}" -f $wr.Left, $wr.Top, $winW, $winH) -ForegroundColor DarkGray
+
 # ---------- 6) 先用「发送」按钮反推输入区，再输入文字 ----------
 # 以前优先用占位字中心，但占位字 OCR 常读成乱码（实测读成「17℃7」）、位置也可能落到
 # 别的控件上（给出过 (238,1302)——那是主窗口左侧聊天区的坐标），文字于是全打进了聊天框，
@@ -1518,9 +1770,13 @@ if ($null -ne $preSendX) {
     $inputY = $preSendY - 15
     Write-Host "[ui] 输入区按发送按钮反推 ($inputX,$inputY)"
 } elseif ($box.Kind -eq 'placeholder') {
-    $inputX = [int]($wr.Left + $winW * 0.72)
-    $inputY = [int]($wr.Bottom - 46)
-    Write-Host "[ui] 输入区按底部几何 ($inputX,$inputY)（占位字坐标不可靠，已弃用）" -ForegroundColor Yellow
+    # 占位字就印在输入框里，它自己就是最准的定位点。
+    # 以前的注释说「占位字坐标不可靠」—— 那是因为当时判据把评论区最新一条当成了占位字。
+    # 判据收紧后（贴底部 + 下方无文字），直接用它的中心点。
+    $cc = Line-Center $box.Line
+    $inputX = [int]($cc[0] + 40)
+    $inputY = [int]$cc[1]
+    Write-Host "[ui] 输入区按占位字 ($inputX,$inputY)" -ForegroundColor Green
 } else {
     $inputX = [int]($wr.Left + $winW * 0.72)
     $inputY = [int]($wr.Top + $winH * 0.88)
@@ -1537,7 +1793,7 @@ $textOk = $false
 $shot2 = $null; $lines2 = @()
 # 回复框贴在右半屏最底部，但占位字 OCR 极不可靠（实测把评论区「B站 BV1jF411B7sw」那行当成占位字，
 # 于是把字打进了空白处）。改为「先按底部几何点，看不到字就上下挪一点重试」。
-$inputYBase = if ($box.Kind -eq 'placeholder') { [int]($wr.Bottom - 46) } else { $inputY }
+$inputYBase = $inputY
 foreach ($dy in @(0, -26, 26, -52, 52, -78)) {
     $tryX = $inputX
     $tryY = [int]($inputYBase + $dy)
